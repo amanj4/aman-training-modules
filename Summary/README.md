@@ -1009,3 +1009,66 @@ The fundamental advance DIF makes is separating *representation* from *isolation
 
 ---
 
+## 7. Optimised Deep Isolation Forest (ODIF)
+
+ODIF is a direct optimisation of DIF. The anomaly detection logic, scoring function (DEAS), and representation scheme (CERE) are **entirely unchanged** — only the training phase is restructured to require less computational power and less memory.
+
+---
+
+### 7.1 The Problem with DIF's Training Phase
+
+In standard DIF, the full training dataset of $N$ samples is transformed into $r$ representations via CERE before any isolation trees are built. The isolation forests then subsample from those already-computed representations. This means:
+
+- All $N$ samples are transformed — even those never used in any tree
+- Memory scales with the full dataset: $O(Nrb)$ for representations, where $b$ is the representation dimensionality
+
+This is wasteful. Each isolation tree only uses $n$ samples (default: 256), and there are $r \times t$ trees total. The rest of the transformed data is computed and stored for nothing.
+
+---
+
+### 7.2 The ODIF Optimisation — Sample First, Transform Second
+
+ODIF flips the order: **select samples before transforming them**.
+
+```
+Step 1 — Pre-sample:  draw all needed indices upfront (t × n total samples)
+Step 2 — Deduplicate: extract unique indices — each sample transformed only once
+Step 3 — Transform:   apply CERE only to this reduced subset
+Step 4 — Build trees: assign pre-sampled (already-transformed) samples to each tree
+(no re-sampling at tree construction time)
+```
+
+**Complexity comparison:**
+
+| | Time complexity | Memory (representations) |
+|--|----------------|--------------------------|
+| DIF | $O(Nar + rt\log n)$ | $O(Nrb)$ |
+| ODIF | $O(tnar + rt\log n)$ | $O(tnrb)$ |
+
+Where $N$ is total training samples and $tn$ is the much smaller number of samples actually needed. For large datasets where $N \gg tn$, this reduction is substantial.
+
+---
+
+### 7.3 Results Summary
+
+Tested across 18 real-world datasets:
+
+**Detection accuracy (PR AUC):** ODIF and DIF produce statistically indistinguishable results ($p = 0.52$) — the optimisation preserves detection quality exactly. Both significantly outperform iForest, ECOD, and SGAE ($p < 0.001$).
+
+**Training speed:**
+
+| Stage | ODIF vs DIF |
+|-------|------------|
+| CPU | ~1.5× faster on average; several-fold on large datasets |
+| GPU | ~150× faster on average (~20 ms vs ~2,600 ms) |
+
+
+**Memory:**
+
+| Resource | Reduction |
+|----------|-----------|
+| RAM | ~18% lower on average |
+| VRAM | ~55% lower on average |
+
+---
+
