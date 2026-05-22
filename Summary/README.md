@@ -1072,3 +1072,185 @@ Tested across 18 real-world datasets:
 
 ---
 
+## 8. ODIF Applied — Anomaly Detection on NPDCL Electricity Consumption Data
+
+This section covers the practical application of ODIF to real-world electricity consumption data from NPDCL (Northern Power Distribution Company of Telangana), with a focus on identifying anomalous consumption patterns that may indicate electricity theft, meter tampering, or faulty equipment.
+
+---
+
+### 8.1 The Dataset
+
+The January 2019 file was used as a representative sample for preliminary EDA due to the size of the complete dataset.
+
+| Column Group | Columns | Notes |
+|---|---|---|
+| Geographic hierarchy | `Circle`, `Division`, `SubDivision`, `Section`, `Area` | 5 levels of location |
+| Billing metrics | `TotServices`, `BilledServices`, `Units`, `Load` | Core signal columns |
+| Temporal | `year`, `month`, `month_name`, `timestamp` | Redundant across columns |
+| Identifiers | `CatCode`, `CatDesc`, `resource_id`, `resource_title` | Zero variance / ID columns |
+
+---
+
+### 8.2 Exploratory Data Analysis
+
+Second layer of EDA was conducted on three sampled files (Jan 2019, May 2022, Dec 2025) to assess consistency before committing to the full dataset.
+
+#### Zero-Variance Columns
+
+`CatCode` (always `7`), `year`, `month`, `CatDesc`, `month_name`, `timestamp`, `resource_id`, and `resource_title` showed zero variance within each individual file — confirmed as constant across files. These carry no discriminating signal and were flagged for removal immediately.
+
+```python
+# Confirming zero variance
+dev_prices.describe()          # std = 0 for CatCode, year, month
+df['CatCode'].value_counts()   # single value: 7
+```
+
+#### Correlation Analysis (Pearson, $|r| > 0.85$)
+
+A correlation heatmap on the combined 3-file mini dataset revealed strong multicollinearity:
+- `TotServices` and `BilledServices` were highly correlated — one to be dropped
+- `Units` and `Load` were highly correlated — one to be dropped
+- `year` and `month` were flagged to be collapsed into a single `time_index`
+
+VIF analysis confirmed these findings — `CatCode`, `month`, `year`, `TotServices`, `BilledServices`, `Load`, and `Units` all returned high VIF values.
+
+#### Categorical Association (Cramér's V)
+
+The five geographic columns — `Circle`, `Division`, `SubDivision`, `Section`, `Area` — showed strong mutual association (high Cramér's V). Rather than dropping all but one, a composite location frequency feature was engineered instead (see Section 8.3).
+
+Similarly, `month_name`, `timestamp`, `resource_id`, and `resource_title` showed perfect association with each other — confirmed as redundant encodings of the same information.
+
+---
+
+### 8.3 Feature Engineering
+
+Four features were constructed from the raw columns before modelling:
+
+```python
+df["time_index"] = (df["year"] - df["year"].min()) * 12 + df["month"]
+
+# Billing rate — proportion of total services that were actually billed
+# Low billing rate = services consumed without being billed → theft signal
+df["billing_rate"] = df["BilledServices"] / df["TotServices"]
+
+# Efficiency — units consumed per unit of load
+# Abnormally high efficiency = high consumption relative to declared load → tampering signal
+df["efficiency"] = df["Units"] / df["Load"]
+
+# Area frequency — encodes the 5 geographic columns into one value:
+# the relative frequency of that location combination in the dataset
+df["loc"] = (df["Circle"].astype(str) + "," + df["Division"].astype(str) + "," +
+             df["SubDivision"].astype(str) + "," + df["Section"].astype(str) + "," +
+             df["Area"].astype(str))
+freq = df["loc"].value_counts(normalize=True)
+df["areas"] = df["loc"].map(freq)
+```
+
+**Why `billing_rate` and `efficiency` matter:**
+
+`billing_rate` close to 0 means services were conducted but not billed — a direct signal of potential illegal activities or meter bypass.  
+`efficiency` captures how many units were consumed per unit of load; an abnormally high ratio suggests the meter is under-reporting the load (stuck meter, tampered meter, or bypassed metering equipment). These two engineered features encode the core theft signatures directly into the feature space rather than leaving ODIF to discover them implicitly.
+
+**Zero-load rows removed:** 16 rows had `Load = 0`, producing undefined `efficiency` values. These were dropped before modelling.
+
+**Final feature set for model input (4 columns):**
+
+```python
+X = df[["time_index", "billing_rate", "efficiency", "areas"]]
+```
+
+All redundant originals (`Units`, `BilledServices`, `Circle`, `Division`, `SubDivision`, `Section`, `Area`, `CatCode`, `CatDesc`, `TotServices`, `Load`, `year`, `month`, `month_name`, `timestamp`, `resource_id`, `resource_title`) were dropped.
+
+---
+
+### 8.4 Data Distribution
+
+Key statistics on the final features from the January 2019 sample (7,105 rows after zero-load filter):
+
+| Feature | Mean | Std | Skew | Notes |
+|---------|------|-----|------|-------|
+| `Units` | 561.88 | 2396 | 9.41 | Heavy right skew — extreme outliers |
+| `Load` | 6.03 | 19.87 | 9.38 | Same pattern as Units |
+| `billing_rate` | 0.62 | 0.43 | −0.55 | Bimodal: 0 (unbilled) and 1 (fully billed) |
+| `efficiency` | 49.16 | 167.91 | 19.27 | Extremely heavy tail |
+| `areas` | 0.03 | 0.01 | — | Frequency-encoded location weight |
+
+`StandardScaler` was applied before modelling to normalise the feature space.
+
+```python
+scaler = StandardScaler()
+X_scaled = scaler.fit_transform(X)
+X_tensor = torch.tensor(X_scaled, dtype=torch.float32)
+```
+
+---
+
+### 8.5 Model — ODIF Configuration
+
+The ODIF implementation was used directly from the author's repository (`lukasz-galka-algorithms/optimized-deep-isolation-forest`).
+
+```python
+model = DeepIF(
+    optimization=True,                   # True = ODIF, False = standard DIF
+    representations_number=50,           # r = 50 random representation spaces
+    trees_per_representation=6,          # t = 6 trees per representation
+    samples_number_per_tree=256,         # n = 256 samples per tree
+    network_hidden_dimensions=[500],     # single hidden layer MLP
+    representation_dimensionality=20,    # project to 20-dimensional spaces
+    batch_size=64,
+    device='cpu',
+    seed=42
+)
+model.fit(X_tensor)
+scores = model.decision_function(X_tensor)
+```
+
+With `optimization=True`, ODIF pre-samples the $t \times n = 6 \times 256 = 1536$ required rows before transformation, rather than transforming all 100,000 rows. For a 100k-row dataset, this reduces the CERE transformation from 100,000 forward passes to a maximum of 1,536 — a ~65× reduction in the number of samples transformed.
+
+---
+
+### 8.6 Anomaly Scoring and Thresholding
+
+ODIF's `decision_function` returns a continuous anomaly score for each row — higher = more anomalous.
+
+**Percentile threshold:**
+```python
+threshold = np.percentile(scores, 99)   # top 1% flagged as anomalous
+df["is_anomaly"] = scores > threshold
+```
+
+A histogram of scores was plotted with the 99th percentile threshold. The distribution showed the expected right-skewed shape: mostly of normal records at low scores, and a sparse high-score tail — the anomalous records.
+
+---
+
+### 8.7 Anomaly Profile — What the Model Found
+
+Normal vs anomalous record means were compared across all features:
+
+```python
+comparison = pd.DataFrame({
+    "normal_mean":  normal[feature_cols].mean(),
+    "anomaly_mean": anomal[feature_cols].mean(),
+})
+comparison["diff_%"] = ((comparison["anomaly_mean"] - comparison["normal_mean"]) / comparison["normal_mean"].abs() * 100).round(1)
+```
+
+The flagged anomalies showed a consistent profile:
+- **High `efficiency`** — units consumed far exceeding expected consumption per unit of load
+- **Low `billing_rate`** — fewer services billed relative to total services connected
+
+This pattern is consistent with **meter tampering or bypassing** — high actual consumption (reflected in Units and Load), under-reporting of billed services (low billing_rate), and a disproportionate ratio of units to load (high efficiency) suggesting the meter is not accurately capturing true consumption.
+
+---
+
+### 8.8 Use Cases
+
+The same ODIF pipeline applied here generalises to several related detection tasks:
+
+**Electricity Theft** — the primary use case. Flags meter tampering, illegal connections, and tariff fraud. Suspicious signature: high consumption + low billing rate + high efficiency ratio.
+
+**Faulty Equipment** — machines consuming abnormal power relative to their rated load appear as high-efficiency anomalies. Distinguishable from theft by geographic context (industrial vs residential areas).
+
+**Predictive Maintenance** — anomalous patterns often precede equipment failures (overheating, motor wear, bearing failures). Early detection reduces downtime and repair cost.
+
+---
