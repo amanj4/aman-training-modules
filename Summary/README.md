@@ -554,12 +554,12 @@ The dataset contains **694 printer/MFD (multi-function device) records** across 
 #### Step 1 — Setup & Data Integrity
 
 ```python
-dev_prices = pd.read_csv("device_price_dataset.csv", encoding='latin1')
-dev_prices = dev_prices.replace('\xa0', ' ', regex=True)   # strip non-breaking spaces
-dev_prices_raw = dev_prices.copy()                          # preserve original
+dev_prices = pd.read_csv("device_price_dataset.csv")
+dev_prices = dev_prices.replace('\xa0', ' ', regex=True)
+dev_prices_raw = dev_prices.copy()
 ```
 
-`encoding='latin1'` handles non-ASCII characters in brand names. The raw copy is preserved before any mutation — a critical habit for reproducibility.
+The raw copy is preserved before any changes are made.
 
 **`printDPI` parsing** — the column stored resolution as a string `"4800 x 1200"`, making it unusable as a numeric feature. It was converted to a single effective DPI by taking the geometric mean of the two components:
 
@@ -571,13 +571,11 @@ dev_prices['printDPI'] = round((
 ) ** 0.5, 2)
 ```
 
-This preserves the relative ordering of DPI values while collapsing the 2D spec into one meaningful scalar.
-
 #### Step 2 — Quality Checks
 
-**No null values** were found across all 694 rows. No exact duplicate rows were found, and all `guid` values were unique — confirming the dataset's integrity.
+**No null values** were found across all 694 rows. No exact duplicate rows were found, and all `guid` values were unique.
 
-**Sentinel value / impossible range checks** flagged several columns with zero values where zero is physically impossible (e.g., `width`, `speedColor`, `standardinputcapacity`, `maximuminputcapacity`). These rows were removed:
+**Impossible range checks** flagged several columns with zero values where zero is physically impossible (e.g., `width`, `speedColor`, `standardinputcapacity`, `maximuminputcapacity`). These rows were removed:
 
 ```python
 dev_prices = dev_prices[dev_prices['width'] != 0]
@@ -622,7 +620,7 @@ For every numeric column, the following statistics were computed and plotted:
 
 - Histogram with mean and median lines overlaid
 - Boxplot showing spread and outlier positions
-- Skewness and kurtosis
+- Skewness
 
 Key findings:
 - `listprice` is approximately uniform across its range (\$25–\$200), with mean ≈ median ≈ \$129 — indicating no strong price-point clustering.
@@ -662,7 +660,7 @@ for _, row in high_corr_df.iterrows():
 
 **Categorical vs Categorical (Cramér's V):**
 - Cramér's V was computed for all categorical pairs. `copy`, `scan`, and `deviceType` showed strong mutual association (all MFDs copy and scan, making these near-constant or redundant).
-- `hasWifi` and `connNetwork` were highly associated — `hasWifi` was dropped as redundant.
+- `hasWifi` and `connNetwork` were highly associated — `hasWifi` was dropped.
 - `copy` and `scan` were dropped for the same reason.
 
 ---
@@ -694,7 +692,7 @@ Categorical (6): printTechnology, hasDuplex, make, connNetwork, hasA3, fax
 
 ### 5.6 Target Engineering — Percentile Binning
 
-The continuous `listprice` column was converted into a discrete class label using `pd.qcut` — quantile-based binning that ensures each bin contains (approximately) the same number of records:
+The `listprice` column was converted into a discrete class label using `pd.qcut` — quantile-based binning:
 
 ```python
 dev_prices["percentile_bin"] = pd.qcut(
@@ -705,25 +703,25 @@ dev_prices["percentile_bin"] = pd.qcut(
 )
 ```
 
-`duplicates='drop'` handles the case where bin edges coincide (can occur with discrete price points). Three scenarios were evaluated:
+Three scenarios were evaluated:
 
 | Scenario | Interval | No. of Bins | Difficulty |
 |----------|----------|-------------|-----------|
-| 1 | 5-percentile | 20 classes | High — fine-grained |
+| 1 | 5-percentile | 20 classes | High |
 | 2 | 10-percentile | 10 classes | Medium |
-| 3 | 20-percentile | 5 classes | Lower — coarse-grained |
+| 3 | 20-percentile | 5 classes | Lower |
 
-A coarser binning results in fewer, wider target classes — easier to classify but less informative. Finer binning gives richer information but makes the boundary between adjacent bins nearly imperceptible to the model (a device at the 5th vs 6th percentile of price may be essentially identical in features).
+A higher percentile binning results in fewer, wider target classes — easier to classify but less informative, and may risk underfitting. Finer binning gives more information but makes the boundary between adjacent bins nearly indifferentiable to the model (a device at the 5th vs 6th percentile of price may have almost identical features) - risks overfitting.
 
 ---
 
-### 5.7 Model — From-Scratch Random Forest
+### 5.7 Model — Random Forest (built from scratch)
 
 The Random Forest was implemented from scratch in Python (no scikit-learn) using the Singleton, Node, and LeafNode class structure.
 
 #### Preprocessing
 
-Since the Decision Tree operates entirely on numeric comparisons, categorical columns were ordinally encoded using a dictionary built during `fit()` and applied during `transform()`:
+Since the Decision Tree operates entirely on numeric comparisons, categorical columns were encoded using a dictionary built during `fit()` and applied during `transform()`:
 
 ```python
 def fit_preprocess(self, dataset):
@@ -741,7 +739,7 @@ def transform(self, dataset):
     return dataset
 ```
 
-Unseen categories at prediction time are filled with the column mean — a safe fallback for ordinal-encoded features.
+The purpose of using this structure was to ensure similar encoding could be done to unseen categorical dataset when the model is tested. Unseen categories at prediction time are filled with the column mean — a safe fallback for ordinal-encoded features.
 
 #### Training Loop
 
@@ -793,8 +791,7 @@ The Gini and information gain functions implement the formulae from Section 4.1 
 ```python
 def gini_impurity(data_subset):
     total = data_subset.count()
-    return 1 - sum((data_subset.value_counts().get(v, 0) / total) ** 2
-                   for v in data_subset.unique())
+    return 1 - sum((data_subset.value_counts().get(v, 0) / total) ** 2 for v in data_subset.unique())
 
 def information_gain(left, right, initial_gini):
     n = left.count() + right.count()
@@ -858,10 +855,157 @@ The accuracy metric used was simple classification accuracy — proportion of te
 
 ### 5.9 Design Observations
 
-**Singleton pattern on the `RandomForest` class** — the `_instance` check in `__new__` ensures only one forest object exists per interpreter session. This is the same Singleton pattern covered in the OOP section.
+**Singleton pattern on the `RandomForest` class** — the `_instance` check in `__new__` ensures only one forest object exists.
 
 **Ordinal encoding vs one-hot** — the custom encoder assigns integers to categories, implying an ordering that may not exist (e.g., `make: Epson=1, Canon=2` implies Epson < Canon, which is meaningless). This can mislead tree splits that treat the encoded value as a continuous threshold. A one-hot encoding would be strictly more correct for nominal categories, at the cost of dimensionality.
 
 **Unique-value threshold splitting** — the split search tries every unique value as a threshold, which is correct but $O(n \cdot p)$ per node. Production implementations (e.g. scikit-learn's ExtraTreesClassifier) use random thresholds for speed.
 
 ---
+
+## 6. Anomaly Detection — Deep Isolation Forest (DIF)
+---
+
+### 6.1 What is Anomaly Detection?
+
+Anomaly detection is the task of assigning an **abnormality score** to each data object in a dataset — no labels required. The goal is to identify data points that are "different" from the majority. Applications of anomaly detection includes fraud detection, fault diagnosis, and electricity theft detection.
+
+The abnormality scoring function is defined as:
+
+$$f: \mathcal{D} \mapsto \mathbb{R}^N$$
+
+where $\mathcal{D} = \{o_1, \ldots, o_N\}$ is the dataset and each output is a real-valued anomaly score. Higher score = more anomalous.
+
+---
+
+### 6.2 The Foundation — Standard Isolation Forest (iForest)
+
+Before understanding DIF, we try to understand what it improves upon.
+
+iForest builds an ensemble of **Isolation Trees (iTrees)**. The intuition is that anomalies are *rare* and *different* and hence require fewer random cuts to isolate than normal points, which are surrounded by similar neighbours. Therefore, they are quickly isolated when passed through an iTree.
+
+**iTree construction:**
+- A random subsample of $n$ data objects initialises the root node
+- At each node, a random feature $j$ is selected, and a random split threshold $\eta$ is selected from the range of values the feature takes on.
+- The node splits into two children: $\{o \mid o^{(j)} \leq \eta\}$ and $\{o \mid o^{(j)} > \eta\}$
+- Recursion continues until each leaf contains one point or maximum depth is reached
+
+**Anomaly scoring:**
+
+The path length from root to leaf node is the isolation difficulty. Shorter path = easier to isolate = more anomalous.
+
+$$\mathcal{F}_{iForest}(o \mid \mathcal{T}) = 2^{-\frac{\mathbb{E}_{\tau \in \mathcal{T}}|p(o|\tau)|}{C(n)}}$$
+
+where $|p(o|\tau)|$ is the path length in tree $\tau$, and $C(n)$ is a normalising factor.
+
+**Strengths of iForest:**
+- Linear time complexity $O(N)$
+- No assumptions about data distribution
+- Scales to large datasets
+
+---
+
+### 6.3 The Two Core Problems with iForest
+
+#### Problem 1 — Hard Anomalies (False Negatives)
+
+iForest only considers **one feature per split** — it is axis-parallel. This means it can only draw horizontal or vertical cuts in the feature space. When anomalies can only be identified by looking at the **combination of multiple features** (e.g., anomalies surrounded by a ring of normal points), iForest cannot isolate them effectively — **false negatives**.
+
+#### Problem 2 — Ghost Regions / Algorithmic Bias
+
+iForest's axis-parallel partitions introduce artefact regions in empty parts of the data space that receive unexpectedly **low anomaly scores**. These are rectangular areas centred around clusters of normal data — regions that contain no samples but are incorrectly treated as "normal" because the axis-parallel cuts happen to produce shallow trees there.
+
+**Extensions like EIF (Extended Isolation Forest)** use random hyperplanes (grandiented cuts with random slopes and intercepts) to partially address the ghost region problem, but they are still *linear partitions* — they cannot handle truly non-linear anomaly boundaries.
+
+---
+
+### 6.4 DIF — The Key Idea
+
+DIF's central insight: **if you cannot separate anomalies with linear cuts in the original space, project the data into new spaces where you can.**
+
+Instead of devising more complex splitting criteria, DIF uses **randomly initialised neural networks** to map data into new representation spaces, then applies the same simple axis-parallel isolation as iForest in those projected spaces. A linear cut in the projected (non-linear) space is equivalent to a **non-linear partition** back in the original data space.
+
+$$\text{Linear cut in projected space} \equiv \text{Non-linear cut in original space}$$
+
+Crucially, the networks are **not trained** — they are only randomly initialised. This is a deliberate design choice (discussed in Section 6.6).
+
+---
+
+### 6.5 The DIF Algorithm
+
+#### Step 1 — Random Representation Ensemble
+
+DIF constructs $r$ representation spaces using $r$ randomly initialised neural networks:
+
+$$\mathcal{G}(\mathcal{D}) = \left\{ \mathcal{X}_u \subset \mathbb{R}^d \mid \mathcal{X}_u = \phi_u(\mathcal{D}; \theta_u) \right\}_{u=1}^{r}$$
+
+where $\phi_u$ is a neural network with randomly initialised weights $\theta_u$ that maps each data object to a $d$-dimensional vector. Each of the $r$ representations is a completely different transformation of the same data because each neural network is randomly initialized.
+
+#### Step 2 — Build iTrees in Projected Spaces
+
+For each of the $r$ representations, $t$ isolation trees are built using standard method — but now operating on the transformed dataset $\mathcal{X}_u$. Total trees: $T = r \times t$.
+
+#### Step 3 — Anomaly Scoring (DEAS)
+
+Standard iForest only uses path length. DIF introduces the **Deviation-Enhanced Anomaly Scoring (DEAS)** function, which incorporates an additional measure of *how far* each data point is from each split threshold it encounters during traversal.
+
+**Averaged deviation degree** for data object $o$ in tree $\tau_i$:
+
+$$g(x_u | \tau_i) = \frac{1}{|p(x_u|\tau_i)|} \sum_{k \in p(x_u|\tau_i)} |x_u^{(j_k)} - \eta_k|$$
+
+A small deviation means the data point was very close to the split threshold — indicating it was in a **dense region** that was difficult to partition cleanly. Large deviations indicate sparse, easily-isolated regions.
+
+**Combined DEAS scoring function:**
+
+$$\mathcal{F}_{DEAS}(o \mid \mathcal{T}) = 2^{-\frac{\mathbb{E}_{\tau_i \in \mathcal{T}}|p(x_u|\tau_i)|}{C(T)}} \times \mathbb{E}_{\tau_i \in \mathcal{T}}\left[g(x_u|\tau_i)\right]$$
+
+The first term is the normal iForest depth-based score from above. The second term multiplies it with the average deviation — a point that is consistently close to split boundaries (small $g$) gets its anomaly score suppressed; a point consistently far from split boundaries (large $g$) gets it amplified.
+
+---
+
+### 6.6 CERE — Computation-Efficient Representation Ensemble
+
+Producing $r$ separate neural networks sequentially would be expensive. DIF solves this with **CERE**, which computes all $r$ representations simultaneously in one forward pass.
+
+The weight matrix $W_i$ for the $i$-th ensemble member is derived from a single shared base matrix $W_0$ and two small random vectors $p_i \in \mathbb{R}^m$ and $q_i \in \mathbb{R}^n$:
+
+$$W_i = W_0 \circ (p_i q_i^\top)$$
+
+where $\circ$ is the Hadamard (element-wise) product. The entire ensemble forward pass then becomes a single batched matrix operation:
+
+$$\begin{bmatrix} XW_1 \\ XW_2 \\ \vdots \\ XW_r \end{bmatrix} = \left( \begin{bmatrix} X \\ X \\ \vdots \\ X \end{bmatrix} \circ \begin{bmatrix} P_1 \\ P_2 \\ \vdots \\ P_r \end{bmatrix} \right) W_0 \circ \begin{bmatrix} Q_1 \\ Q_2 \\ \vdots \\ Q_r \end{bmatrix}$$
+
+This reduces the cost of generating $r$ representations to approximately the cost of a single network's forward pass, since all ensemble members are computed in parallel.
+
+**Time complexity:** $O(ND \cdot r \times t)$ — linear in data size $N$, dimensionality $D$, and ensemble size. This inherits iForest's scalability.
+
+---
+
+### 6.7 Why Random (Not Trained) Representations?
+
+This is the most counterintuitive design choice in DIF, yet is key to the models success.
+
+Trained representations have two critical weaknesses in this context:
+
+1. **Loss functions are not universal.** A loss that works well for one dataset's anomaly structure may be a poor fit for another. There is no single supervised representation learning objective that generalises across diverse anomaly types.
+
+2. **Optimisation kills diversity.** Isolation-based scoring works because the *ensemble* of diverse trees covers many different views of the data. If all representations are optimised toward the same objective, they converge and the benefit of ensembling is lost.
+
+Randomly initialised networks, by contrast, produce **diverse** projections. Non-linear activation functions (e.g., ReLU, Tanh) in these randomly initialised networks fold and bend the data space in different directions — even without training, they create genuinely diverse views. Hard anomalies that are inseparable in the original space will be exposed as easy-to-isolate in at least some projected spaces. Because anomaly scoring is an average over all trees, the anomaly will stand out wherever it is successfully isolated.
+
+---
+
+### 6.8 Summary — What Makes DIF Better
+
+| Limitation | iForest | EIF | DIF |
+|-----------|---------|-----|-----|
+| Linear cuts only | axis-parallel | oblique linear | non-linear via NN projection |
+| Ghost region bias | ✗ severe | ✗ partial | ✓ eliminated |
+| Hard anomaly detection | ✗ | ✗ partial | ✓ |
+| High-dimensional data | ✓ | ✗ OOM on extreme dims | ✓ (projects to small $d$) |
+| Scalability | $O(N)$ | $O(N)$ | $O(N)$ — via CERE |
+
+The fundamental advance DIF makes is separating *representation* from *isolation* — using neural networks not as learned detectors, but as **random space transformers** that give the simple axis-parallel isolation mechanism the freedom to operate effectively in any direction in the original data space.
+
+---
+
